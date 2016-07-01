@@ -2,13 +2,23 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <stdint.h>
+
+#include <sys/mman.h>
 
 #include <ffi.h>
 
 #include "flog.h"
 #include "util.h"
 
-static char mbuf[1 << 20];
+#define MAGIC 0xABCDABCD
+
+#define BUF_SIZE (1<<20)
+static char _mbuf[BUF_SIZE];
+static char *mbuf = _mbuf;
+static char *fbuf;
+static uint64_t fsize;
+static uint64_t mbuf_size = sizeof(_mbuf);
 
 int flog_decode_all(int fdin, int fdout)
 {
@@ -34,8 +44,10 @@ int flog_decode_all(int fdin, int fdout)
 			fprintf(stderr, "Unable to read a message: %m");
 			return -1;
 		}
+		if (m->magic != MAGIC)
+			break;
 		ret = m->size - sizeof(m);
-		if (m->size > sizeof(mbuf)) {
+		if (m->size > mbuf_size) {
 			fprintf(stderr, "The buffer is too small");
 			return -1;
 		}
@@ -61,29 +73,64 @@ int flog_decode_all(int fdin, int fdout)
 	return 0;
 }
 
-int flog_enqueue(flog_msg_t *m)
+static int flog_enqueue(flog_msg_t *m)
 {
-	m->size = (m->size + 63) / 64 * 64;
-	write(1, m, m->size);
+	if (write(1, m, m->size) != m->size) {
+		fprintf(stderr, "Unable to write a message\n");
+		return -1;
+	}
 	return 0;
 }
 
 extern char *rodata_start;
 extern char *rodata_end;
 
+int flog_map_buf(int fdout)
+{
+	uint64_t off = 0;
+
+	if (fbuf && (mbuf - fbuf < BUF_SIZE))
+		return 0;
+
+	if (fbuf) {
+		munmap(fbuf, BUF_SIZE * 2);
+		off = mbuf - fbuf - BUF_SIZE;
+	}
+
+	if (fsize == 0)
+		fsize += BUF_SIZE;
+	fsize += BUF_SIZE;
+
+	ftruncate(fdout, fsize);
+
+	fbuf = mmap(NULL, BUF_SIZE * 2, PROT_WRITE | PROT_READ, MAP_FILE | MAP_SHARED, fdout, fsize - 2 * BUF_SIZE);
+	if (fbuf == MAP_FAILED)
+		return -1;
+
+	mbuf = fbuf + off;
+	mbuf_size = 2 * BUF_SIZE;
+
+	return 0;
+}
+
 void flog_encode_msg(int fdout, unsigned int nargs, unsigned int mask, const char *format, ...)
 {
-	flog_msg_t *m = (void *)mbuf;
+	flog_msg_t *m;
 	va_list argptr;
 	char *str_start;
 	size_t i, n;
+
+	if (flog_map_buf(fdout))
+		return;
+
+	m = (void *) mbuf;
 
 	m->nargs = nargs;
 	m->mask = mask;
 
 	str_start = (void *)m->args + sizeof(m->args[0]) * nargs;
 	n = strlen(format) + 1;
-	if (sizeof(mbuf) < (str_start + n + 1 - mbuf)) {
+	if (mbuf_size < (str_start + n + 1 - mbuf)) {
 		fprintf(stderr, "No memory for string argument\n");
 		return;
 	}
@@ -102,7 +149,7 @@ void flog_encode_msg(int fdout, unsigned int nargs, unsigned int mask, const cha
 		if (mask & (1u << i)) {
 			n = strlen((void *)m->args[i]);
 
-			if (sizeof(mbuf) > (str_start + n + 1 - mbuf)) {
+			if (mbuf_size > (str_start + n + 1 - mbuf)) {
 				memcpy(str_start, (void *)m->args[i], n + 1);
 				m->args[i] = str_start - mbuf;
 				str_start += n + 1;
@@ -114,6 +161,13 @@ void flog_encode_msg(int fdout, unsigned int nargs, unsigned int mask, const cha
 	}
 	va_end(argptr);
 	m->size = str_start - mbuf;
+	m->magic = MAGIC;
 
-	flog_enqueue(m);
+	m->size = (m->size + 7) / 8 * 8;
+	if (mbuf == _mbuf)
+		flog_enqueue(m);
+	else {
+		mbuf += m->size;
+		mbuf_size -= m->size;
+	}
 }
